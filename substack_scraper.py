@@ -1,12 +1,13 @@
 """
 Purpose:
-    Scrape paid subscription articles from a Substack newsletter, saving both HTML and Markdown versions.
-    You must edit BASE_URL and SITEMAP_STRING below to match your target newsletter.
+    Scrape paid subscription articles from Substack newsletters, saving both HTML and Markdown versions.
+    Supports scraping multiple substacks from a text file.
 
 Instructions:
-    - Set BASE_URL to the newsletter's main URL (e.g., "https://newsletter.eng-leadership.com")
-    - Set SITEMAP_STRING to the sitemap path (e.g., "/sitemap.xml")
+    - Use --substacks to specify a txt file with one substack base URL per line
+    - Or set DEFAULT_SUBSTACK below for single-substack mode
     - Use --paid flag to enable scraping paid content (manual login required)
+    - Use --days to filter articles by age
 """
 
 import requests
@@ -18,17 +19,17 @@ from selenium import webdriver
 from time import sleep
 import argparse
 import os
+import random
 from datetime import datetime, timedelta
 
-BASE_URL = "https://thescienceofhitting.com"  # Change to your newsletter base URL
-SITEMAP_STRING = "/sitemap.xml"  # Change if your sitemap path is different
-
-SITEMAP_URL = BASE_URL + SITEMAP_STRING
+DEFAULT_SUBSTACK = "https://thescienceofhitting.com"  # Default if no --substacks file provided
+SITEMAP_STRING = "/sitemap.xml"
 
 OUTPUT_FILE = "articles.json"
 
 
-def selenium_login():
+def selenium_login(check_url=None):
+    """Initialize Selenium driver and handle login if needed. Login is shared across all substacks."""
     # Use a persistent profile in the script directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     profile_dir = os.path.join(script_dir, "chrome_profile")
@@ -42,7 +43,8 @@ def selenium_login():
     driver = webdriver.Chrome(options=options)
     
     # Check if already logged in by looking for common logged-in indicators
-    driver.get(BASE_URL)
+    test_url = check_url or "https://substack.com"
+    driver.get(test_url)
     sleep(2)
     
     # Check if we need to log in (look for subscribe/sign-in buttons as indicator of not logged in)
@@ -55,6 +57,7 @@ def selenium_login():
         print("Please log into Substack in the browser window.")
         print("Once you see your account/dashboard, come back here.")
         print("(Your login will be saved for future runs!)")
+        print("This login will work for ALL substacks you're scraping.")
         print("="*50)
         input("\nPress Enter after you have logged in to continue...")
     else:
@@ -87,36 +90,60 @@ def extract_article_html_and_md(soup):
     return html_content, markdown_content
 
 
+def random_delay():
+    """Add a random delay between 0.5 and 3 seconds."""
+    delay = random.uniform(0.5, 3.0)
+    sleep(delay)
+
+
 def scrape_article_selenium(driver, url):
     driver.get(url)
     sleep(0.3)
     soup = BeautifulSoup(driver.page_source, "lxml")
+    random_delay()
     return extract_article_html_and_md(soup)
 
 
 def scrape_article_requests(url):
     resp = requests.get(url)
     soup = BeautifulSoup(resp.content, "lxml")
+    random_delay()
     return extract_article_html_and_md(soup)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Substack scraper")
-    parser.add_argument("--paid", action="store_true", help="Enable scraping paid content (manual login required)")
-    parser.add_argument("--days", type=int, default=None, help="Only scrape articles from the last N days (default: all articles)")
-    args = parser.parse_args()
+def get_substack_name(base_url):
+    """Extract substack name from URL for folder organization."""
+    # e.g., "https://thescienceofhitting.com" -> "thescienceofhitting"
+    name = base_url.replace("https://", "").replace("http://", "")
+    name = name.split(".")[0]  # Get first part before .com/.substack.com
+    return name
 
-    driver = None
-    if args.paid:
-        print("Paid mode enabled. Manual login required.")
-        driver = selenium_login()
-    else:
-        print("Paid mode not enabled. Scraping free content only.")
 
+def load_substacks(file_path):
+    """Load substack base URLs from a text file."""
+    substacks = []
+    with open(file_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):  # Skip empty lines and comments
+                # Ensure URL doesn't have trailing slash
+                substacks.append(line.rstrip("/"))
+    return substacks
+
+
+def scrape_single_substack(base_url, driver, args, all_results):
+    """Scrape a single substack and return results."""
+    substack_name = get_substack_name(base_url)
+    sitemap_url = base_url + SITEMAP_STRING
+    
+    print(f"\n{'='*50}")
+    print(f"Scraping: {substack_name} ({base_url})")
+    print(f"{'='*50}")
+    
     print("Fetching sitemap...")
-    urls, url_to_lastmod = get_article_urls_and_lastmod(SITEMAP_URL)
+    urls, url_to_lastmod = get_article_urls_and_lastmod(sitemap_url)
     print(f"Found {len(urls)} articles in sitemap.")
-
+    
     # Filter articles by date if --days is specified
     if args.days is not None:
         cutoff_date = datetime.now() - timedelta(days=args.days)
@@ -125,27 +152,21 @@ def main():
             lastmod = url_to_lastmod.get(url, "")
             if lastmod:
                 try:
-                    # Parse ISO format date (e.g., "2025-01-15T12:00:00Z" or "2025-01-15")
                     date_str = lastmod.split("T")[0]
                     article_date = datetime.strptime(date_str, "%Y-%m-%d")
                     if article_date >= cutoff_date:
                         filtered_urls.append(url)
                 except ValueError:
-                    # If date parsing fails, include the article
                     filtered_urls.append(url)
             else:
-                # If no lastmod, include the article
                 filtered_urls.append(url)
         urls = filtered_urls
         print(f"Filtered to {len(urls)} articles from the last {args.days} days.")
-    with open("urls.txt", "w") as url_file:
-        for url in urls:
-            url_file.write(url + "\n")
-    print(f"Saved URLs to urls.txt")
-    # Create folders for html and md files, clearing them first
-    html_dir = "html_files"
-    md_dir = "md_files"
-    # Remove all files in html_files and md_files if they exist
+    
+    # Create substack-specific output folders
+    html_dir = os.path.join("html_files", substack_name)
+    md_dir = os.path.join("md_files", substack_name)
+    
     for folder in [html_dir, md_dir]:
         if os.path.exists(folder):
             for filename in os.listdir(folder):
@@ -154,8 +175,8 @@ def main():
                     os.remove(file_path)
         else:
             os.makedirs(folder, exist_ok=True)
+    
     results = []
-    # for url in urls[:5]:  # to test on less articles
     for url in urls:
         print(f"Scraping {url}")
         if args.paid:
@@ -174,10 +195,67 @@ def main():
                 f_html.write(html)
             with open(md_path, "w", encoding="utf-8") as f_md:
                 f_md.write(md)
-            results.append({"url": url, "html_file": html_path, "md_file": md_path})
+            results.append({
+                "substack": substack_name,
+                "url": url,
+                "html_file": html_path,
+                "md_file": md_path
+            })
+    
+    print(f"Scraped {len(results)} articles from {substack_name}")
+    all_results.extend(results)
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Substack scraper - scrape one or multiple substacks")
+    parser.add_argument("--paid", action="store_true", help="Enable scraping paid content (manual login required)")
+    parser.add_argument("--days", type=int, default=None, help="Only scrape articles from the last N days (default: all articles)")
+    parser.add_argument("--substacks", type=str, default=None, help="Path to txt file with substack URLs (one per line)")
+    args = parser.parse_args()
+
+    # Determine which substacks to scrape
+    if args.substacks:
+        if not os.path.exists(args.substacks):
+            print(f"Error: Substacks file '{args.substacks}' not found.")
+            return
+        substacks = load_substacks(args.substacks)
+        print(f"Loaded {len(substacks)} substacks from {args.substacks}")
+    else:
+        substacks = [DEFAULT_SUBSTACK]
+        print(f"No --substacks file provided, using default: {DEFAULT_SUBSTACK}")
+
+    driver = None
+    if args.paid:
+        print("Paid mode enabled. Manual login required.")
+        driver = selenium_login(substacks[0])  # Check login with first substack
+    else:
+        print("Paid mode not enabled. Scraping free content only.")
+
+    all_results = []
+    
+    # Process each substack
+    for i, base_url in enumerate(substacks):
+        print(f"\n[{i+1}/{len(substacks)}] Processing substack...")
+        try:
+            scrape_single_substack(base_url, driver, args, all_results)
+        except Exception as e:
+            print(f"Error scraping {base_url}: {e}")
+            continue
+        
+        # Add delay between substacks (except after the last one)
+        if i < len(substacks) - 1:
+            delay = random.uniform(2.0, 5.0)
+            print(f"Waiting {delay:.1f}s before next substack...")
+            sleep(delay)
+
+    # Save combined results
     with open(OUTPUT_FILE, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"Saved {len(results)} articles to {OUTPUT_FILE}")
+        json.dump(all_results, f, indent=2)
+    print(f"\n{'='*50}")
+    print(f"DONE! Saved {len(all_results)} total articles to {OUTPUT_FILE}")
+    print(f"{'='*50}")
+    
     if driver:
         driver.quit()
 
