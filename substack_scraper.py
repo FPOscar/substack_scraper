@@ -67,6 +67,27 @@ def selenium_login(check_url=None):
     return driver
 
 
+def is_article_url(url):
+    """Check if URL is an actual article (not archive, about, podcast, etc.)."""
+    # Substack articles typically have /p/ in the URL
+    if "/p/" in url:
+        return True
+    # Skip known non-article pages
+    skip_patterns = [
+        "/archive", "/about", "/podcast", "/subscribe", 
+        "/recommendations", "/leaderboard", "/notes",
+        "/badge", "/embed", "/gift"
+    ]
+    for pattern in skip_patterns:
+        if url.rstrip("/").endswith(pattern) or f"{pattern}/" in url:
+            return False
+    # If URL is just the base domain, skip it
+    path = url.replace("https://", "").replace("http://", "")
+    if path.count("/") <= 1:  # e.g., "example.com" or "example.com/"
+        return False
+    return True
+
+
 def get_article_urls_and_lastmod(sitemap_url):
     resp = requests.get(sitemap_url)
     soup = BeautifulSoup(resp.content, "xml")
@@ -77,8 +98,10 @@ def get_article_urls_and_lastmod(sitemap_url):
         lastmod = url_tag.find("lastmod")
         if loc:
             url_text = loc.text
-            urls.append(url_text)
-            url_to_lastmod[url_text] = lastmod.text if lastmod else ""
+            # Only include actual article URLs
+            if is_article_url(url_text):
+                urls.append(url_text)
+                url_to_lastmod[url_text] = lastmod.text if lastmod else ""
     return urls, url_to_lastmod
 
 
