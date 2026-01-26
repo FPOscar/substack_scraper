@@ -96,18 +96,54 @@ def random_delay():
     sleep(delay)
 
 
-def scrape_article_selenium(driver, url):
-    driver.get(url)
-    sleep(0.3)
+def is_rate_limited(content):
+    """Check if page content indicates rate limiting."""
+    content_lower = content.lower()
+    return "too many requests" in content_lower or "rate limit" in content_lower
+
+
+def scrape_article_selenium(driver, url, max_retries=3):
+    """Scrape article with Selenium, with retry logic for rate limiting."""
+    for attempt in range(max_retries):
+        driver.get(url)
+        sleep(0.3)
+        page_content = driver.page_source
+        
+        if is_rate_limited(page_content):
+            wait_time = (attempt + 1) * 10  # 10s, 20s, 30s
+            print(f"  Rate limited! Waiting {wait_time}s before retry ({attempt + 1}/{max_retries})...")
+            sleep(wait_time)
+            continue
+        
+        soup = BeautifulSoup(page_content, "lxml")
+        random_delay()
+        return extract_article_html_and_md(soup)
+    
+    # If all retries failed, return what we have
+    print(f"  Warning: Still rate limited after {max_retries} retries")
     soup = BeautifulSoup(driver.page_source, "lxml")
-    random_delay()
     return extract_article_html_and_md(soup)
 
 
-def scrape_article_requests(url):
-    resp = requests.get(url)
+def scrape_article_requests(url, max_retries=3):
+    """Scrape article with requests, with retry logic for rate limiting."""
+    for attempt in range(max_retries):
+        resp = requests.get(url)
+        
+        # Check for HTTP 429 or rate limit text in response
+        if resp.status_code == 429 or is_rate_limited(resp.text):
+            wait_time = (attempt + 1) * 10  # 10s, 20s, 30s
+            print(f"  Rate limited! Waiting {wait_time}s before retry ({attempt + 1}/{max_retries})...")
+            sleep(wait_time)
+            continue
+        
+        soup = BeautifulSoup(resp.content, "lxml")
+        random_delay()
+        return extract_article_html_and_md(soup)
+    
+    # If all retries failed, return what we have
+    print(f"  Warning: Still rate limited after {max_retries} retries")
     soup = BeautifulSoup(resp.content, "lxml")
-    random_delay()
     return extract_article_html_and_md(soup)
 
 
