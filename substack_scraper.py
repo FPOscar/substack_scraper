@@ -150,7 +150,12 @@ def scrape_article_requests(url, max_retries=3):
 def get_substack_name(base_url):
     """Extract substack name from URL for folder organization."""
     # e.g., "https://thescienceofhitting.com" -> "thescienceofhitting"
+    # e.g., "https://www.yetanothervalueblog.com" -> "yetanothervalueblog"
+    # e.g., "https://mbideepdives.substack.com" -> "mbideepdives"
     name = base_url.replace("https://", "").replace("http://", "")
+    # Remove www. prefix if present
+    if name.startswith("www."):
+        name = name[4:]
     name = name.split(".")[0]  # Get first part before .com/.substack.com
     return name
 
@@ -231,6 +236,7 @@ def scrape_single_substack(base_url, driver, args, all_results):
                 f_html.write(html)
             with open(md_path, "w", encoding="utf-8") as f_md:
                 f_md.write(md)
+                f_md.write(f"\n\n---\n\nSource: {url}\n")
             results.append({
                 "substack": substack_name,
                 "url": url,
