@@ -17,8 +17,10 @@ import json
 from selenium import webdriver
 from time import sleep
 import argparse
+import os
+from datetime import datetime, timedelta
 
-BASE_URL = "https://newsletter.eng-leadership.com"  # Change to your newsletter base URL
+BASE_URL = "https://thescienceofhitting.com"  # Change to your newsletter base URL
 SITEMAP_STRING = "/sitemap.xml"  # Change if your sitemap path is different
 
 SITEMAP_URL = BASE_URL + SITEMAP_STRING
@@ -27,9 +29,37 @@ OUTPUT_FILE = "articles.json"
 
 
 def selenium_login():
-    driver = webdriver.Chrome()
-    driver.get("https://substack.com/sign-in")
-    input("After you have logged in and see your account, press Enter here to continue...")
+    # Use a persistent profile in the script directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    profile_dir = os.path.join(script_dir, "chrome_profile")
+    
+    options = webdriver.ChromeOptions()
+    options.add_argument(f"--user-data-dir={profile_dir}")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--disable-extensions")
+    
+    driver = webdriver.Chrome(options=options)
+    
+    # Check if already logged in by looking for common logged-in indicators
+    driver.get(BASE_URL)
+    sleep(2)
+    
+    # Check if we need to log in (look for subscribe/sign-in buttons as indicator of not logged in)
+    page_source = driver.page_source.lower()
+    needs_login = "sign in" in page_source and "subscribe" in page_source and "your account" not in page_source
+    
+    if needs_login:
+        driver.get("https://substack.com/sign-in")
+        print("\n" + "="*50)
+        print("Please log into Substack in the browser window.")
+        print("Once you see your account/dashboard, come back here.")
+        print("(Your login will be saved for future runs!)")
+        print("="*50)
+        input("\nPress Enter after you have logged in to continue...")
+    else:
+        print("Already logged in! Using saved session.")
+    
     print("Continuing with scraping...")
     return driver
 
@@ -73,6 +103,7 @@ def scrape_article_requests(url):
 def main():
     parser = argparse.ArgumentParser(description="Substack scraper")
     parser.add_argument("--paid", action="store_true", help="Enable scraping paid content (manual login required)")
+    parser.add_argument("--days", type=int, default=None, help="Only scrape articles from the last N days (default: all articles)")
     args = parser.parse_args()
 
     driver = None
@@ -84,15 +115,34 @@ def main():
 
     print("Fetching sitemap...")
     urls, url_to_lastmod = get_article_urls_and_lastmod(SITEMAP_URL)
-    print(f"Found {len(urls)} articles.")
+    print(f"Found {len(urls)} articles in sitemap.")
+
+    # Filter articles by date if --days is specified
+    if args.days is not None:
+        cutoff_date = datetime.now() - timedelta(days=args.days)
+        filtered_urls = []
+        for url in urls:
+            lastmod = url_to_lastmod.get(url, "")
+            if lastmod:
+                try:
+                    # Parse ISO format date (e.g., "2025-01-15T12:00:00Z" or "2025-01-15")
+                    date_str = lastmod.split("T")[0]
+                    article_date = datetime.strptime(date_str, "%Y-%m-%d")
+                    if article_date >= cutoff_date:
+                        filtered_urls.append(url)
+                except ValueError:
+                    # If date parsing fails, include the article
+                    filtered_urls.append(url)
+            else:
+                # If no lastmod, include the article
+                filtered_urls.append(url)
+        urls = filtered_urls
+        print(f"Filtered to {len(urls)} articles from the last {args.days} days.")
     with open("urls.txt", "w") as url_file:
         for url in urls:
             url_file.write(url + "\n")
     print(f"Saved URLs to urls.txt")
     # Create folders for html and md files, clearing them first
-    import os
-    import shutil
-
     html_dir = "html_files"
     md_dir = "md_files"
     # Remove all files in html_files and md_files if they exist
