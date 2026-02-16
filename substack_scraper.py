@@ -19,6 +19,7 @@ from selenium import webdriver
 from time import sleep
 import argparse
 import os
+import shutil
 import random
 from datetime import datetime, timedelta
 
@@ -272,6 +273,35 @@ def scrape_single_substack(base_url, driver, args, all_results):
     return results
 
 
+def archive_md_files(md_base="md_files"):
+    """Copy all MD files into a timestamped subfolder for archival."""
+    if not os.path.exists(md_base):
+        print("No md_files directory found, skipping archive.")
+        return
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    archive_dir = os.path.join(md_base, "_archive", timestamp)
+
+    os.makedirs(archive_dir, exist_ok=True)
+
+    count = 0
+    for substack_name in sorted(os.listdir(md_base)):
+        substack_dir = os.path.join(md_base, substack_name)
+        if not os.path.isdir(substack_dir) or substack_name == "_archive":
+            continue
+        for md_file in sorted(os.listdir(substack_dir)):
+            if not md_file.endswith(".md"):
+                continue
+            src = os.path.join(substack_dir, md_file)
+            shutil.copy2(src, os.path.join(archive_dir, md_file))
+            count += 1
+
+    if count:
+        print(f"Archived {count} MD files to {archive_dir}")
+    else:
+        print("No MD files found to archive.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Substack scraper - scrape one or multiple substacks")
     parser.add_argument("--paid", action="store_true", help="Enable scraping paid content (manual login required)")
@@ -320,7 +350,10 @@ def main():
     print(f"\n{'='*50}")
     print(f"DONE! Saved {len(all_results)} total articles to {OUTPUT_FILE}")
     print(f"{'='*50}")
-    
+
+    # Archive all MD files into a timestamped subfolder
+    archive_md_files()
+
     if driver:
         driver.quit()
 
