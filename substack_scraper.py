@@ -211,14 +211,15 @@ def scrape_single_substack(base_url, driver, args, all_results):
     
     # Filter articles by date if --days is specified
     if args.days is not None:
-        cutoff_date = datetime.now() - timedelta(days=args.days)
+        # Compare date-only values so `--days 1` reliably includes yesterday.
+        cutoff_date = (datetime.now() - timedelta(days=args.days)).date()
         filtered_urls = []
         for url in urls:
             lastmod = url_to_lastmod.get(url, "")
             if lastmod:
                 try:
-                    date_str = lastmod.split("T")[0]
-                    article_date = datetime.strptime(date_str, "%Y-%m-%d")
+                    date_str = lastmod.strip()[:10]  # Expected YYYY-MM-DD
+                    article_date = datetime.strptime(date_str, "%Y-%m-%d").date()
                     if article_date >= cutoff_date:
                         filtered_urls.append(url)
                 except ValueError:

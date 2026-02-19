@@ -6,3 +6,4 @@ substacks.txt
 articles.json
 substack_images.docx
 *.docx
+/__pycache__/
