@@ -21,7 +21,13 @@ import argparse
 import os
 import shutil
 import random
+import re
+import subprocess
+import sys
+import importlib
+from io import BytesIO
 from datetime import datetime, timedelta
+from xml.sax.saxutils import escape
 
 DEFAULT_SUBSTACK = "https://thescienceofhitting.com"  # Default if no --substacks file provided
 SITEMAP_STRING = "/sitemap.xml"
@@ -196,6 +202,350 @@ def load_substacks(file_path):
     return substacks
 
 
+def get_article_title_from_filename(filename):
+    """Extract a readable article title from a markdown filename."""
+    name = os.path.splitext(filename)[0]
+    if re.match(r"^\d{4}-\d{2}-\d{2}_", name):
+        name = name[11:]
+    title = name.replace("-", " ").replace("_", " ").strip()
+    return title.title() if title else filename
+
+
+def _markdown_inline_to_html(text):
+    """Convert basic inline markdown into ReportLab-compatible HTML."""
+    if not text:
+        return ""
+
+    # Replace markdown images with text placeholders for inline contexts.
+    text = re.sub(
+        r"!\[([^\]]*)\]\((https?://[^\s)]+)(?:\s+\"[^\"]*\")?\)",
+        lambda m: f"[Image: {(m.group(1) or 'image').strip()}] {m.group(2).strip()}",
+        text,
+    )
+
+    def apply_basic_formatting(segment):
+        escaped_segment = escape(segment)
+        escaped_segment = re.sub(
+            r"`([^`]+)`",
+            lambda m: f'<font face="Courier">{m.group(1)}</font>',
+            escaped_segment,
+        )
+        escaped_segment = re.sub(r"\*\*([^\*]+)\*\*", r"<b>\1</b>", escaped_segment)
+        escaped_segment = re.sub(r"(?<!\*)\*([^\*\n]+)\*(?!\*)", r"<i>\1</i>", escaped_segment)
+        escaped_segment = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"<i>\1</i>", escaped_segment)
+        return escaped_segment
+
+    # Keep link conversion conservative; malformed markdown remains plain text.
+    link_pattern = re.compile(r"\[([^\]]+)\]\((https?://[^\s\"'<>]+)\)")
+    output = []
+    last_end = 0
+    for match in link_pattern.finditer(text):
+        output.append(apply_basic_formatting(text[last_end:match.start()]))
+        label = apply_basic_formatting(match.group(1))
+        href = escape(match.group(2))
+        output.append(f'<link href="{href}">{label}</link>')
+        last_end = match.end()
+    output.append(apply_basic_formatting(text[last_end:]))
+    return "".join(output)
+
+
+def _extract_image_from_markdown_line(text):
+    """Extract markdown image info from an image-only line."""
+    line = text.strip()
+
+    linked_image = re.match(
+        r'^\[\!\[([^\]]*)\]\((https?://[^\s)]+)(?:\s+\"[^\"]*\")?\)\]\((https?://[^\s)]+)\)$',
+        line,
+    )
+    if linked_image:
+        alt_text = linked_image.group(1).strip() or "image"
+        image_url = linked_image.group(3).strip()
+        return alt_text, image_url
+
+    plain_image = re.match(
+        r'^\!\[([^\]]*)\]\((https?://[^\s)]+)(?:\s+\"[^\"]*\")?\)$',
+        line,
+    )
+    if plain_image:
+        alt_text = plain_image.group(1).strip() or "image"
+        image_url = plain_image.group(2).strip()
+        return alt_text, image_url
+
+    return None, None
+
+
+def _add_image_to_story(image_url, alt_text, story, styles, image_cls, paragraph_cls, image_cache):
+    """Download and embed an image in the PDF, with link fallback."""
+    image_bytes = image_cache.get(image_url)
+    if image_bytes is None and image_url not in image_cache:
+        try:
+            resp = requests.get(
+                image_url,
+                timeout=20,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if resp.status_code == 200 and resp.content:
+                image_bytes = resp.content
+                image_cache[image_url] = image_bytes
+            else:
+                image_cache[image_url] = False
+        except Exception:
+            image_cache[image_url] = False
+
+    image_bytes = image_cache.get(image_url)
+    if image_bytes and image_bytes is not False:
+        try:
+            flowable = image_cls(BytesIO(image_bytes))
+            flowable.hAlign = "CENTER"
+            flowable._restrictSize(460, 460)
+            story.append(flowable)
+            story.append(styles["Spacer"](1, 6))
+            caption = _markdown_inline_to_html(alt_text or "image")
+            story.append(paragraph_cls(caption, styles["ImageCaption"]))
+            story.append(styles["Spacer"](1, 10))
+            return
+        except Exception:
+            pass
+
+    fallback = f'[Image: {escape(alt_text or "image")}] <link href="{escape(image_url)}">{escape(image_url)}</link>'
+    story.append(paragraph_cls(fallback, styles["Body"]))
+    story.append(styles["Spacer"](1, 8))
+
+
+def _append_markdown_to_story(md_text, story, styles, hr_cls, pre_cls, image_cls, image_cache):
+    """Render markdown into a simple, clean PDF structure."""
+    lines = md_text.splitlines()
+    para_buffer = []
+    in_code_block = False
+    code_buffer = []
+
+    def add_small_spacer():
+        story.append(styles["Spacer"](1, 8))
+
+    def flush_paragraph():
+        if not para_buffer:
+            return
+        text = " ".join(part.strip() for part in para_buffer if part.strip())
+        para_buffer.clear()
+        if not text:
+            return
+
+        source_match = re.match(r"^Source:\s+(https?://\S+)\s*$", text, flags=re.IGNORECASE)
+        if source_match:
+            url = escape(source_match.group(1))
+            text = f'Source: <link href="{url}">{url}</link>'
+        else:
+            text = _markdown_inline_to_html(text)
+
+        story.append(pre_cls(text, styles["Body"]))
+        add_small_spacer()
+
+    heading_styles = {
+        1: "Heading1",
+        2: "Heading2",
+        3: "Heading3",
+    }
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            flush_paragraph()
+            if in_code_block:
+                if code_buffer:
+                    story.append(pre_cls("\n".join(code_buffer), styles["Code"]))
+                    add_small_spacer()
+                code_buffer = []
+                in_code_block = False
+            else:
+                in_code_block = True
+            continue
+
+        if in_code_block:
+            code_buffer.append(line)
+            continue
+
+        if not stripped:
+            flush_paragraph()
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading_match:
+            flush_paragraph()
+            level = min(len(heading_match.group(1)), 3)
+            heading_text = _markdown_inline_to_html(heading_match.group(2))
+            story.append(pre_cls(heading_text, styles[heading_styles[level]]))
+            add_small_spacer()
+            continue
+
+        if re.match(r"^---+$", stripped):
+            flush_paragraph()
+            story.append(hr_cls(width="100%"))
+            add_small_spacer()
+            continue
+
+        alt_text, image_url = _extract_image_from_markdown_line(stripped)
+        if image_url:
+            flush_paragraph()
+            _add_image_to_story(image_url, alt_text, story, styles, image_cls, pre_cls, image_cache)
+            continue
+
+        bullet_match = re.match(r"^[-*]\s+(.*)$", stripped)
+        if bullet_match:
+            flush_paragraph()
+            bullet_text = _markdown_inline_to_html(bullet_match.group(1))
+            story.append(pre_cls(bullet_text, styles["Bullet"], bulletText="-"))
+            continue
+
+        numbered_match = re.match(r"^(\d+)\.\s+(.*)$", stripped)
+        if numbered_match:
+            flush_paragraph()
+            bullet_text = _markdown_inline_to_html(numbered_match.group(2))
+            story.append(pre_cls(bullet_text, styles["Bullet"], bulletText=f'{numbered_match.group(1)}.'))
+            continue
+
+        para_buffer.append(stripped)
+
+    flush_paragraph()
+
+
+def create_archive_pdf(archive_dir):
+    """Create a combined PDF from archived markdown files with a linked TOC."""
+    if not archive_dir or not os.path.exists(archive_dir):
+        print("Archive directory not found, skipping PDF generation.")
+        return
+
+    md_files = sorted([name for name in os.listdir(archive_dir) if name.endswith(".md")])
+    if not md_files:
+        print("No markdown files found in archive, skipping PDF generation.")
+        return
+
+    try:
+        importlib.import_module("reportlab")
+    except ImportError:
+        print("reportlab not installed. Installing now...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "reportlab"])
+
+    colors = importlib.import_module("reportlab.lib.colors")
+    pagesizes = importlib.import_module("reportlab.lib.pagesizes")
+    styles_module = importlib.import_module("reportlab.lib.styles")
+    platypus = importlib.import_module("reportlab.platypus")
+
+    LETTER = pagesizes.LETTER
+    ParagraphStyle = styles_module.ParagraphStyle
+    getSampleStyleSheet = styles_module.getSampleStyleSheet
+    HRFlowable = platypus.HRFlowable
+    PageBreak = platypus.PageBreak
+    Paragraph = platypus.Paragraph
+    SimpleDocTemplate = platypus.SimpleDocTemplate
+    Spacer = platypus.Spacer
+    Image = platypus.Image
+
+    pdf_path = os.path.join(archive_dir, "combined_archive.pdf")
+    doc = SimpleDocTemplate(
+        pdf_path,
+        pagesize=LETTER,
+        leftMargin=50,
+        rightMargin=50,
+        topMargin=50,
+        bottomMargin=50,
+        title="Substack Archive",
+    )
+
+    base_styles = getSampleStyleSheet()
+    styles = {
+        "Title": ParagraphStyle(
+            "ArchiveTitle",
+            parent=base_styles["Title"],
+            fontSize=24,
+            spaceAfter=14,
+            alignment=1,
+        ),
+        "Subtitle": ParagraphStyle(
+            "ArchiveSubtitle",
+            parent=base_styles["Normal"],
+            fontSize=11,
+            textColor=colors.grey,
+            alignment=1,
+            spaceAfter=20,
+        ),
+        "TocHeading": ParagraphStyle(
+            "TocHeading",
+            parent=base_styles["Heading1"],
+            spaceAfter=12,
+        ),
+        "TocEntry": ParagraphStyle(
+            "TocEntry",
+            parent=base_styles["Normal"],
+            leftIndent=16,
+            leading=16,
+            textColor=colors.HexColor("#1f4e79"),
+            spaceAfter=4,
+        ),
+        "ArticleHeading": ParagraphStyle(
+            "ArticleHeading",
+            parent=base_styles["Heading1"],
+            fontSize=18,
+            spaceAfter=10,
+        ),
+        "Heading1": ParagraphStyle("MdH1", parent=base_styles["Heading1"], fontSize=16, spaceAfter=6),
+        "Heading2": ParagraphStyle("MdH2", parent=base_styles["Heading2"], fontSize=14, spaceAfter=6),
+        "Heading3": ParagraphStyle("MdH3", parent=base_styles["Heading3"], fontSize=12, spaceAfter=4),
+        "Body": ParagraphStyle("MdBody", parent=base_styles["BodyText"], leading=16),
+        "Bullet": ParagraphStyle("MdBullet", parent=base_styles["BodyText"], leftIndent=20, leading=16),
+        "Code": ParagraphStyle(
+            "MdCode",
+            parent=base_styles["Code"],
+            fontName="Courier",
+            fontSize=9,
+            leading=12,
+            backColor=colors.HexColor("#f5f5f5"),
+            borderPadding=6,
+        ),
+        "ImageCaption": ParagraphStyle(
+            "ImageCaption",
+            parent=base_styles["Italic"],
+            alignment=1,
+            textColor=colors.grey,
+            fontSize=9,
+        ),
+        "Spacer": Spacer,
+    }
+    image_cache = {}
+
+    story = []
+    story.append(Paragraph("Substack Daily Archive", styles["Title"]))
+    story.append(Paragraph(f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}', styles["Subtitle"]))
+    story.append(Paragraph("Table of Contents", styles["TocHeading"]))
+
+    for index, md_file in enumerate(md_files, start=1):
+        article_title = get_article_title_from_filename(md_file)
+        toc_line = (
+            f'{index}. <link href="#article_{index}">{escape(article_title)}</link>'
+        )
+        story.append(Paragraph(toc_line, styles["TocEntry"]))
+
+    story.append(PageBreak())
+
+    for index, md_file in enumerate(md_files, start=1):
+        md_path = os.path.join(archive_dir, md_file)
+        with open(md_path, "r", encoding="utf-8") as handle:
+            md_text = handle.read()
+
+        article_title = get_article_title_from_filename(md_file)
+        heading = f'<a name="article_{index}"/>{escape(article_title)}'
+        story.append(Paragraph(heading, styles["ArticleHeading"]))
+        story.append(Paragraph(f"File: {escape(md_file)}", styles["Subtitle"]))
+        _append_markdown_to_story(md_text, story, styles, HRFlowable, Paragraph, Image, image_cache)
+
+        if index < len(md_files):
+            story.append(PageBreak())
+
+    doc.build(story)
+    print(f"Created combined PDF archive: {pdf_path}")
+
+
 def scrape_single_substack(base_url, driver, args, all_results):
     """Scrape a single substack and return results."""
     substack_name = get_substack_name(base_url)
@@ -278,7 +628,7 @@ def archive_md_files(md_base="md_files"):
     """Copy all MD files into a timestamped subfolder for archival."""
     if not os.path.exists(md_base):
         print("No md_files directory found, skipping archive.")
-        return
+        return None
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     archive_dir = os.path.join(md_base, "_archive", timestamp)
@@ -299,8 +649,10 @@ def archive_md_files(md_base="md_files"):
 
     if count:
         print(f"Archived {count} MD files to {archive_dir}")
+        return archive_dir
     else:
         print("No MD files found to archive.")
+        return None
 
 
 def main():
@@ -353,7 +705,8 @@ def main():
     print(f"{'='*50}")
 
     # Archive all MD files into a timestamped subfolder
-    archive_md_files()
+    archive_dir = archive_md_files()
+    create_archive_pdf(archive_dir)
 
     if driver:
         driver.quit()
